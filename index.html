@@ -1,1 +1,282 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Offline QR Wi-Fi Share</title>
+  <script src="./qrcode.min.js"></script>
+  <script src="./html5-qrcode.min.js"></script>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 500px; margin: 20px auto; padding: 15px; background: #f4f4f9; color: #222; }
+    .card { background: white; padding: 20px; border-radius: 12px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); margin-bottom: 16px; }
+    button { width: 100%; padding: 12px; margin-top: 10px; border: none; border-radius: 8px; background: #0066ff; color: white; font-weight: bold; font-size: 1em; cursor: pointer; }
+    button.secondary { background: #333; }
+    button:disabled { background: #aaa; cursor: not-allowed; }
+    #qrcode { display: flex; justify-content: center; margin: 15px 0; }
+    #reader { width: 100%; margin-top: 10px; border-radius: 8px; overflow: hidden; }
+    .hidden { display: none; }
+    progress { width: 100%; height: 18px; margin-top: 10px; border-radius: 6px; }
+    .status-text { font-size: 0.85em; color: #555; margin-top: 4px; }
+    #received-list a { display: block; margin: 8px 0; padding: 10px; background: #e8f5e9; color: #2e7d32; text-decoration: none; border-radius: 6px; font-weight: bold; word-break: break-all; }
+    .badge { display: inline-block; padding: 3px 8px; font-size: 0.75em; border-radius: 12px; background: #e0e7ff; color: #1d4ed8; font-weight: bold; }
+  </style>
+</head>
+<body>
 
+  <div class="card" id="setup-card">
+    <div style="display:flex; justify-content:space-between; align-items:center;">
+      <h3 style="margin:0;">1. Connect Offline</h3>
+      <span class="badge" id="cache-status">Caching...</span>
+    </div>
+    <p style="font-size: 0.9em; color: #555;">Connect both devices to the same Wi-Fi or Mobile Hotspot first.</p>
+    <button id="host-btn">Device A: Create Connection QR</button>
+    <button id="join-btn" class="secondary">Device B: Scan Host QR</button>
+  </div>
+
+  <div class="card hidden" id="qr-card">
+    <h3 id="qr-title">Scan QR Code</h3>
+    <p id="qr-instruction" style="font-size: 0.9em; color: #555;"></p>
+    <div id="qrcode"></div>
+    <button id="scan-reply-btn" class="hidden">Step 2: Scan Reply QR from Device B</button>
+    <div id="reader" class="hidden"></div>
+  </div>
+
+  <div class="card hidden" id="transfer-card">
+    <h3 style="color: #16a34a; margin-top: 0;">● Connected Locally</h3>
+    <input type="file" id="file-input" multiple style="width: 100%;">
+    <button id="send-btn">Send Selected Files</button>
+    
+    <div id="send-progress-box" class="hidden">
+      <progress id="send-progress" value="0" max="100"></progress>
+      <div class="status-text" id="send-status">Sending...</div>
+    </div>
+
+    <hr style="margin: 20px 0; border: 0; border-top: 1px solid #eee;">
+
+    <h4 style="margin-bottom: 8px;">Received Files</h4>
+    <div id="receive-progress-box" class="hidden">
+      <progress id="receive-progress" value="0" max="100"></progress>
+      <div class="status-text" id="receive-status">Receiving...</div>
+    </div>
+    <div id="received-list">Waiting for files...</div>
+  </div>
+
+  <script>
+    if ('serviceWorker' in navigator) {
+      navigator.serviceWorker.register('./sw.js').then(() => {
+        document.getElementById('cache-status').textContent = 'Ready Offline';
+      }).catch(() => {
+        document.getElementById('cache-status').textContent = 'Online Only';
+      });
+    }
+
+    const pc = new RTCPeerConnection({ iceServers: [] });
+    let dataChannel = null;
+    let html5QrCode = null;
+    const CHUNK_SIZE = 16384;
+
+    const setupCard = document.getElementById('setup-card');
+    const qrCard = document.getElementById('qr-card');
+    const transferCard = document.getElementById('transfer-card');
+    const qrTitle = document.getElementById('qr-title');
+    const qrInstruction = document.getElementById('qr-instruction');
+    const qrContainer = document.getElementById('qrcode');
+    const scanReplyBtn = document.getElementById('scan-reply-btn');
+    const readerEl = document.getElementById('reader');
+
+    function gatherIceCandidates() {
+      return new Promise((resolve) => {
+        if (pc.iceGatheringState === 'complete') return resolve();
+        const check = () => {
+          if (pc.iceGatheringState === 'complete') {
+            pc.removeEventListener('icegatheringstatechange', check);
+            resolve();
+          }
+        };
+        pc.addEventListener('icegatheringstatechange', check);
+        setTimeout(resolve, 1500);
+      });
+    }
+
+    function showQRCode(dataString) {
+      qrContainer.innerHTML = '';
+      new QRCode(qrContainer, {
+        text: dataString,
+        width: 260,
+        height: 260,
+        correctLevel: QRCode.CorrectLevel.L
+      });
+    }
+
+    function startScanner(onScanSuccess) {
+      readerEl.classList.remove('hidden');
+      html5QrCode = new Html5Qrcode("reader");
+      html5QrCode.start(
+        { facingMode: "environment" },
+        { fps: 10, qrbox: { width: 250, height: 250 } },
+        (decodedText) => {
+          html5QrCode.stop().then(() => {
+            readerEl.classList.add('hidden');
+            onScanSuccess(decodedText);
+          });
+        },
+        () => {}
+      ).catch(err => alert("Camera error: " + err));
+    }
+
+    function setupDataChannel(channel) {
+      dataChannel = channel;
+      dataChannel.binaryType = 'arraybuffer';
+      dataChannel.bufferedAmountLowThreshold = 65536;
+
+      dataChannel.onopen = () => {
+        qrCard.classList.add('hidden');
+        transferCard.classList.remove('hidden');
+      };
+
+      let incomingMeta = null;
+      let receiveBuffer = [];
+      let receivedBytes = 0;
+
+      const recBox = document.getElementById('receive-progress-box');
+      const recBar = document.getElementById('receive-progress');
+      const recStatus = document.getElementById('receive-status');
+
+      dataChannel.onmessage = (event) => {
+        if (typeof event.data === 'string') {
+          const msg = JSON.parse(event.data);
+          if (msg.type === 'meta') {
+            incomingMeta = msg;
+            receiveBuffer = [];
+            receivedBytes = 0;
+            recBox.classList.remove('hidden');
+            recBar.value = 0;
+            recStatus.textContent = `Receiving ${msg.name}... 0%`;
+          } else if (msg.type === 'eof' && incomingMeta) {
+            const blob = new Blob(receiveBuffer, { type: incomingMeta.fileType });
+            const url = URL.createObjectURL(blob);
+            const list = document.getElementById('received-list');
+            if (list.textContent === 'Waiting for files...') list.innerHTML = '';
+
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = incomingMeta.name;
+            const sizeMB = (incomingMeta.size / (1024 * 1024)).toFixed(2);
+            a.textContent = `Download: ${incomingMeta.name} (${sizeMB} MB)`;
+            list.appendChild(a);
+
+            recBox.classList.add('hidden');
+            receiveBuffer = [];
+            incomingMeta = null;
+          }
+          return;
+        }
+
+        if (incomingMeta) {
+          receiveBuffer.push(event.data);
+          receivedBytes += event.data.byteLength;
+          const pct = Math.min(100, Math.round((receivedBytes / incomingMeta.size) * 100));
+          recBar.value = pct;
+          recStatus.textContent = `Receiving ${incomingMeta.name}... ${pct}%`;
+        }
+      };
+    }
+
+    document.getElementById('host-btn').addEventListener('click', async () => {
+      setupCard.classList.add('hidden');
+      qrCard.classList.remove('hidden');
+      qrTitle.textContent = "Step 1: Have Device B Scan This";
+      qrInstruction.textContent = "Generating local network offer...";
+
+      const channel = pc.createDataChannel("file-transfer");
+      setupDataChannel(channel);
+
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+      await gatherIceCandidates();
+
+      showQRCode(JSON.stringify({ t: pc.localDescription.type, s: pc.localDescription.sdp }));
+      qrInstruction.textContent = "Once Device B scans this, tap below to scan Device B's reply QR.";
+      scanReplyBtn.classList.remove('hidden');
+    });
+
+    scanReplyBtn.addEventListener('click', () => {
+      qrContainer.innerHTML = '';
+      scanReplyBtn.classList.add('hidden');
+      qrTitle.textContent = "Step 2: Scan Device B's QR Code";
+      qrInstruction.textContent = "Point your camera at Device B's screen.";
+
+      startScanner(async (scannedData) => {
+        const parsed = JSON.parse(scannedData);
+        await pc.setRemoteDescription(new RTCSessionDescription({ type: parsed.t, sdp: parsed.s }));
+      });
+    });
+
+    document.getElementById('join-btn').addEventListener('click', () => {
+      setupCard.classList.add('hidden');
+      qrCard.classList.remove('hidden');
+      qrTitle.textContent = "Step 1: Scan Device A's QR Code";
+      qrInstruction.textContent = "Point your camera at Device A's screen.";
+
+      pc.ondatachannel = (event) => setupDataChannel(event.channel);
+
+      startScanner(async (scannedData) => {
+        const parsed = JSON.parse(scannedData);
+        await pc.setRemoteDescription(new RTCSessionDescription({ type: parsed.t, sdp: parsed.s }));
+
+        const answer = await pc.createAnswer();
+        await pc.setLocalDescription(answer);
+        await gatherIceCandidates();
+
+        qrTitle.textContent = "Step 2: Have Device A Scan This";
+        qrInstruction.textContent = "Show this QR code to Device A's camera to finish connecting.";
+        showQRCode(JSON.stringify({ t: pc.localDescription.type, s: pc.localDescription.sdp }));
+      });
+    });
+
+    document.getElementById('send-btn').addEventListener('click', async () => {
+      const files = document.getElementById('file-input').files;
+      if (!files.length || !dataChannel || dataChannel.readyState !== 'open') return;
+
+      const sendBtn = document.getElementById('send-btn');
+      const sendBox = document.getElementById('send-progress-box');
+      const sendBar = document.getElementById('send-progress');
+      const sendStatus = document.getElementById('send-status');
+
+      sendBtn.disabled = true;
+      sendBox.classList.remove('hidden');
+
+      for (const file of files) {
+        dataChannel.send(JSON.stringify({ type: 'meta', name: file.name, size: file.size, fileType: file.type }));
+
+        let offset = 0;
+        while (offset < file.size) {
+          if (dataChannel.bufferedAmount > 262144) {
+            await new Promise((resolve) => {
+              dataChannel.onbufferedamountlow = () => {
+                dataChannel.onbufferedamountlow = null;
+                resolve();
+              };
+            });
+          }
+
+          const slice = file.slice(offset, offset + CHUNK_SIZE);
+          const buffer = await slice.arrayBuffer();
+          dataChannel.send(buffer);
+          offset += buffer.byteLength;
+
+          const pct = Math.min(100, Math.round((offset / file.size) * 100));
+          sendBar.value = pct;
+          sendStatus.textContent = `Sending ${file.name}... ${pct}%`;
+        }
+
+        dataChannel.send(JSON.stringify({ type: 'eof' }));
+      }
+
+      sendStatus.textContent = 'All files sent!';
+      sendBtn.disabled = false;
+      setTimeout(() => sendBox.classList.add('hidden'), 3000);
+    });
+  </script>
+</body>
+</html>
