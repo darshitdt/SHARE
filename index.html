@@ -3,9 +3,9 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Offline QR Wi-Fi Share</title>
-  <script src="./qrcode.min.js"></script>
-  <script src="./html5-qrcode.min.js"></script>
+  <title>Offline Wi-Fi Share</title>
+  <!-- Lightweight embedded QR code generator -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcode-generator/1.4.4/qrcode.min.js"></script>
   <style>
     body { font-family: system-ui, sans-serif; max-width: 500px; margin: 20px auto; padding: 15px; background: #f4f4f9; color: #222; }
     .card { background: white; padding: 20px; border-radius: 12px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); margin-bottom: 16px; }
@@ -13,7 +13,8 @@
     button.secondary { background: #333; }
     button:disabled { background: #aaa; cursor: not-allowed; }
     #qrcode { display: flex; justify-content: center; margin: 15px 0; }
-    #reader { width: 100%; margin-top: 10px; border-radius: 8px; overflow: hidden; }
+    #qrcode canvas, #qrcode img { max-width: 100%; border-radius: 8px; }
+    video { width: 100%; border-radius: 8px; background: #000; margin-top: 10px; display: none; }
     .hidden { display: none; }
     progress { width: 100%; height: 18px; margin-top: 10px; border-radius: 6px; }
     .status-text { font-size: 0.85em; color: #555; margin-top: 4px; }
@@ -28,7 +29,7 @@
       <h3 style="margin:0;">1. Connect Offline</h3>
       <span class="badge" id="cache-status">Caching...</span>
     </div>
-    <p style="font-size: 0.9em; color: #555;">Connect both devices to the same Wi-Fi or Mobile Hotspot first.</p>
+    <p style="font-size: 0.9em; color: #555;">Connect both devices to the same Wi-Fi Hotspot first.</p>
     <button id="host-btn">Device A: Create Connection QR</button>
     <button id="join-btn" class="secondary">Device B: Scan Host QR</button>
   </div>
@@ -38,7 +39,7 @@
     <p id="qr-instruction" style="font-size: 0.9em; color: #555;"></p>
     <div id="qrcode"></div>
     <button id="scan-reply-btn" class="hidden">Step 2: Scan Reply QR from Device B</button>
-    <div id="reader" class="hidden"></div>
+    <video id="scanner-video" autoplay playsinline></video>
   </div>
 
   <div class="card hidden" id="transfer-card">
@@ -72,7 +73,8 @@
 
     const pc = new RTCPeerConnection({ iceServers: [] });
     let dataChannel = null;
-    let html5QrCode = null;
+    let videoStream = null;
+    let scanningActive = false;
     const CHUNK_SIZE = 16384;
 
     const setupCard = document.getElementById('setup-card');
@@ -82,7 +84,7 @@
     const qrInstruction = document.getElementById('qr-instruction');
     const qrContainer = document.getElementById('qrcode');
     const scanReplyBtn = document.getElementById('scan-reply-btn');
-    const readerEl = document.getElementById('reader');
+    const videoEl = document.getElementById('scanner-video');
 
     function gatherIceCandidates() {
       return new Promise((resolve) => {
@@ -100,28 +102,57 @@
 
     function showQRCode(dataString) {
       qrContainer.innerHTML = '';
-      new QRCode(qrContainer, {
-        text: dataString,
-        width: 260,
-        height: 260,
-        correctLevel: QRCode.CorrectLevel.L
-      });
+      const typeNumber = 0;
+      const errorCorrectionLevel = 'L';
+      const qr = qrcode(typeNumber, errorCorrectionLevel);
+      qr.addData(dataString);
+      qr.make();
+      qrContainer.innerHTML = qr.createImgTag(4);
     }
 
-    function startScanner(onScanSuccess) {
-      readerEl.classList.remove('hidden');
-      html5QrCode = new Html5Qrcode("reader");
-      html5QrCode.start(
-        { facingMode: "environment" },
-        { fps: 10, qrbox: { width: 250, height: 250 } },
-        (decodedText) => {
-          html5QrCode.stop().then(() => {
-            readerEl.classList.add('hidden');
-            onScanSuccess(decodedText);
-          });
-        },
-        () => {}
-      ).catch(err => alert("Camera error: " + err));
+    async function startNativeScanner(onScanSuccess) {
+      videoEl.classList.remove('hidden');
+      try {
+        videoStream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' } });
+        videoEl.srcObject = videoStream;
+        await videoEl.play();
+
+        if (!('BarcodeDetector' in window)) {
+          alert('BarcodeDetector API not supported on this browser version. Please use Chrome on Android.');
+          return;
+        }
+
+        const detector = new BarcodeDetector({ formats: ['qr_code'] });
+        scanningActive = true;
+
+        const scanLoop = async () => {
+          if (!scanningActive) return;
+          try {
+            const codes = await detector.detect(videoEl);
+            if (codes.length > 0) {
+              scanningActive = false;
+              stopCamera();
+              onScanSuccess(codes[0].rawValue);
+              return;
+            }
+          } catch (err) {
+            // Ignore frame detection misses
+          }
+          requestAnimationFrame(scanLoop);
+        };
+        requestAnimationFrame(scanLoop);
+      } catch (err) {
+        alert('Camera access error: ' + err.message);
+      }
+    }
+
+    function stopCamera() {
+      scanningActive = false;
+      if (videoStream) {
+        videoStream.getTracks().forEach(track => track.stop());
+        videoStream = null;
+      }
+      videoEl.classList.add('hidden');
     }
 
     function setupDataChannel(channel) {
@@ -130,6 +161,7 @@
       dataChannel.bufferedAmountLowThreshold = 65536;
 
       dataChannel.onopen = () => {
+        stopCamera();
         qrCard.classList.add('hidden');
         transferCard.classList.remove('hidden');
       };
@@ -206,7 +238,7 @@
       qrTitle.textContent = "Step 2: Scan Device B's QR Code";
       qrInstruction.textContent = "Point your camera at Device B's screen.";
 
-      startScanner(async (scannedData) => {
+      startNativeScanner(async (scannedData) => {
         const parsed = JSON.parse(scannedData);
         await pc.setRemoteDescription(new RTCSessionDescription({ type: parsed.t, sdp: parsed.s }));
       });
@@ -220,7 +252,7 @@
 
       pc.ondatachannel = (event) => setupDataChannel(event.channel);
 
-      startScanner(async (scannedData) => {
+      startNativeScanner(async (scannedData) => {
         const parsed = JSON.parse(scannedData);
         await pc.setRemoteDescription(new RTCSessionDescription({ type: parsed.t, sdp: parsed.s }));
 
