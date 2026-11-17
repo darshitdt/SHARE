@@ -1,9 +1,7 @@
-const CACHE_NAME = 'offline-qr-share-v1';
+const CACHE_NAME = 'offline-share-v2';
 const ASSETS = [
   './',
-  './index.html',
-  './qrcode.min.js',
-  './html5-qrcode.min.js'
+  './index.html'
 ];
 
 self.addEventListener('install', (event) => {
