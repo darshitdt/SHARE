@@ -4,42 +4,44 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Offline Wi-Fi Share</title>
-  <!-- Lightweight embedded QR code generator -->
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcode-generator/1.4.4/qrcode.min.js"></script>
   <style>
     body { font-family: system-ui, sans-serif; max-width: 500px; margin: 20px auto; padding: 15px; background: #f4f4f9; color: #222; }
     .card { background: white; padding: 20px; border-radius: 12px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); margin-bottom: 16px; }
     button { width: 100%; padding: 12px; margin-top: 10px; border: none; border-radius: 8px; background: #0066ff; color: white; font-weight: bold; font-size: 1em; cursor: pointer; }
     button.secondary { background: #333; }
     button:disabled { background: #aaa; cursor: not-allowed; }
-    #qrcode { display: flex; justify-content: center; margin: 15px 0; }
-    #qrcode canvas, #qrcode img { max-width: 100%; border-radius: 8px; }
+    #text-qr { background: #eef3ff; padding: 15px; border-radius: 8px; word-break: break-all; font-family: monospace; font-size: 0.85em; text-align: center; margin: 10px 0; }
+    textarea { width: 100%; height: 80px; margin-top: 10px; padding: 8px; box-sizing: border-box; border-radius: 6px; border: 1px solid #ccc; }
     video { width: 100%; border-radius: 8px; background: #000; margin-top: 10px; display: none; }
     .hidden { display: none; }
     progress { width: 100%; height: 18px; margin-top: 10px; border-radius: 6px; }
     .status-text { font-size: 0.85em; color: #555; margin-top: 4px; }
     #received-list a { display: block; margin: 8px 0; padding: 10px; background: #e8f5e9; color: #2e7d32; text-decoration: none; border-radius: 6px; font-weight: bold; word-break: break-all; }
-    .badge { display: inline-block; padding: 3px 8px; font-size: 0.75em; border-radius: 12px; background: #e0e7ff; color: #1d4ed8; font-weight: bold; }
   </style>
 </head>
 <body>
 
   <div class="card" id="setup-card">
-    <div style="display:flex; justify-content:space-between; align-items:center;">
-      <h3 style="margin:0;">1. Connect Offline</h3>
-      <span class="badge" id="cache-status">Caching...</span>
-    </div>
-    <p style="font-size: 0.9em; color: #555;">Connect both devices to the same Wi-Fi Hotspot first.</p>
-    <button id="host-btn">Device A: Create Connection QR</button>
-    <button id="join-btn" class="secondary">Device B: Scan Host QR</button>
+    <h3 style="margin-top:0;">1. Connect Offline via Hotspot</h3>
+    <p style="font-size: 0.9em; color: #555;">Connect both devices to the same local Wi-Fi Hotspot.</p>
+    <button id="host-btn">Device A: Create Connection Code</button>
+    <button id="join-btn" class="secondary">Device B: Enter Connection Code</button>
   </div>
 
-  <div class="card hidden" id="qr-card">
-    <h3 id="qr-title">Scan QR Code</h3>
-    <p id="qr-instruction" style="font-size: 0.9em; color: #555;"></p>
-    <div id="qrcode"></div>
-    <button id="scan-reply-btn" class="hidden">Step 2: Scan Reply QR from Device B</button>
-    <video id="scanner-video" autoplay playsinline></video>
+  <div class="card hidden" id="connection-card">
+    <h3 id="conn-title">Connection Code</h3>
+    <p id="conn-instruction" style="font-size: 0.9em; color: #555;"></p>
+    <div id="text-qr">Generating code...</div>
+    <div id="reply-box" class="hidden">
+      <p style="font-size: 0.9em; font-weight: bold; margin-top: 15px;">Paste Reply Code from Device B:</p>
+      <textarea id="remote-answer-input" placeholder="Paste code here..."></textarea>
+      <button id="connect-confirm-btn">Complete Connection</button>
+    </div>
+    <div id="join-box" class="hidden">
+      <p style="font-size: 0.9em; font-weight: bold; margin-top: 15px;">Paste Device A's Code Here:</p>
+      <textarea id="remote-offer-input" placeholder="Paste code here..."></textarea>
+      <button id="join-submit-btn">Generate Reply Code</button>
+    </div>
   </div>
 
   <div class="card hidden" id="transfer-card">
@@ -63,28 +65,18 @@
   </div>
 
   <script>
-    if ('serviceWorker' in navigator) {
-      navigator.serviceWorker.register('./sw.js').then(() => {
-        document.getElementById('cache-status').textContent = 'Ready Offline';
-      }).catch(() => {
-        document.getElementById('cache-status').textContent = 'Online Only';
-      });
-    }
-
     const pc = new RTCPeerConnection({ iceServers: [] });
     let dataChannel = null;
-    let videoStream = null;
-    let scanningActive = false;
     const CHUNK_SIZE = 16384;
 
     const setupCard = document.getElementById('setup-card');
-    const qrCard = document.getElementById('qr-card');
+    const connCard = document.getElementById('connection-card');
     const transferCard = document.getElementById('transfer-card');
-    const qrTitle = document.getElementById('qr-title');
-    const qrInstruction = document.getElementById('qr-instruction');
-    const qrContainer = document.getElementById('qrcode');
-    const scanReplyBtn = document.getElementById('scan-reply-btn');
-    const videoEl = document.getElementById('scanner-video');
+    const connTitle = document.getElementById('conn-title');
+    const connInstruction = document.getElementById('conn-instruction');
+    const textQr = document.getElementById('text-qr');
+    const replyBox = document.getElementById('reply-box');
+    const joinBox = document.getElementById('join-box');
 
     function gatherIceCandidates() {
       return new Promise((resolve) => {
@@ -100,69 +92,13 @@
       });
     }
 
-    function showQRCode(dataString) {
-      qrContainer.innerHTML = '';
-      const typeNumber = 0;
-      const errorCorrectionLevel = 'L';
-      const qr = qrcode(typeNumber, errorCorrectionLevel);
-      qr.addData(dataString);
-      qr.make();
-      qrContainer.innerHTML = qr.createImgTag(4);
-    }
-
-    async function startNativeScanner(onScanSuccess) {
-      videoEl.classList.remove('hidden');
-      try {
-        videoStream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' } });
-        videoEl.srcObject = videoStream;
-        await videoEl.play();
-
-        if (!('BarcodeDetector' in window)) {
-          alert('BarcodeDetector API not supported on this browser version. Please use Chrome on Android.');
-          return;
-        }
-
-        const detector = new BarcodeDetector({ formats: ['qr_code'] });
-        scanningActive = true;
-
-        const scanLoop = async () => {
-          if (!scanningActive) return;
-          try {
-            const codes = await detector.detect(videoEl);
-            if (codes.length > 0) {
-              scanningActive = false;
-              stopCamera();
-              onScanSuccess(codes[0].rawValue);
-              return;
-            }
-          } catch (err) {
-            // Ignore frame detection misses
-          }
-          requestAnimationFrame(scanLoop);
-        };
-        requestAnimationFrame(scanLoop);
-      } catch (err) {
-        alert('Camera access error: ' + err.message);
-      }
-    }
-
-    function stopCamera() {
-      scanningActive = false;
-      if (videoStream) {
-        videoStream.getTracks().forEach(track => track.stop());
-        videoStream = null;
-      }
-      videoEl.classList.add('hidden');
-    }
-
     function setupDataChannel(channel) {
       dataChannel = channel;
       dataChannel.binaryType = 'arraybuffer';
       dataChannel.bufferedAmountLowThreshold = 65536;
 
       dataChannel.onopen = () => {
-        stopCamera();
-        qrCard.classList.add('hidden');
+        connCard.classList.add('hidden');
         transferCard.classList.remove('hidden');
       };
 
@@ -214,11 +150,12 @@
       };
     }
 
+    // Host Flow
     document.getElementById('host-btn').addEventListener('click', async () => {
       setupCard.classList.add('hidden');
-      qrCard.classList.remove('hidden');
-      qrTitle.textContent = "Step 1: Have Device B Scan This";
-      qrInstruction.textContent = "Generating local network offer...";
+      connCard.classList.remove('hidden');
+      connTitle.textContent = "Step 1: Copy Code for Device B";
+      connInstruction.textContent = "Copy this text code and give it to Device B via WhatsApp/Bluetooth or text message over the hotspot network:";
 
       const channel = pc.createDataChannel("file-transfer");
       setupDataChannel(channel);
@@ -227,45 +164,53 @@
       await pc.setLocalDescription(offer);
       await gatherIceCandidates();
 
-      showQRCode(JSON.stringify({ t: pc.localDescription.type, s: pc.localDescription.sdp }));
-      qrInstruction.textContent = "Once Device B scans this, tap below to scan Device B's reply QR.";
-      scanReplyBtn.classList.remove('hidden');
+      textQr.textContent = btoa(JSON.stringify({ t: pc.localDescription.type, s: pc.localDescription.sdp }));
+      replyBox.classList.remove('hidden');
     });
 
-    scanReplyBtn.addEventListener('click', () => {
-      qrContainer.innerHTML = '';
-      scanReplyBtn.classList.add('hidden');
-      qrTitle.textContent = "Step 2: Scan Device B's QR Code";
-      qrInstruction.textContent = "Point your camera at Device B's screen.";
-
-      startNativeScanner(async (scannedData) => {
-        const parsed = JSON.parse(scannedData);
+    document.getElementById('connect-confirm-btn').addEventListener('click', async () => {
+      try {
+        const raw = document.getElementById('remote-answer-input').value.trim();
+        const parsed = JSON.parse(atob(raw));
         await pc.setRemoteDescription(new RTCSessionDescription({ type: parsed.t, sdp: parsed.s }));
-      });
+      } catch (err) {
+        alert("Invalid code format!");
+      }
     });
 
+    // Joiner Flow
     document.getElementById('join-btn').addEventListener('click', () => {
       setupCard.classList.add('hidden');
-      qrCard.classList.remove('hidden');
-      qrTitle.textContent = "Step 1: Scan Device A's QR Code";
-      qrInstruction.textContent = "Point your camera at Device A's screen.";
+      connCard.classList.remove('hidden');
+      connTitle.textContent = "Step 1: Enter Host Code";
+      connInstruction.textContent = "Paste the code you received from Device A below:";
+      textQr.style.display = 'none';
+      joinBox.classList.remove('hidden');
 
       pc.ondatachannel = (event) => setupDataChannel(event.channel);
+    });
 
-      startNativeScanner(async (scannedData) => {
-        const parsed = JSON.parse(scannedData);
+    document.getElementById('join-submit-btn').addEventListener('click', async () => {
+      try {
+        const raw = document.getElementById('remote-offer-input').value.trim();
+        const parsed = JSON.parse(atob(raw));
         await pc.setRemoteDescription(new RTCSessionDescription({ type: parsed.t, sdp: parsed.s }));
 
         const answer = await pc.createAnswer();
         await pc.setLocalDescription(answer);
         await gatherIceCandidates();
 
-        qrTitle.textContent = "Step 2: Have Device A Scan This";
-        qrInstruction.textContent = "Show this QR code to Device A's camera to finish connecting.";
-        showQRCode(JSON.stringify({ t: pc.localDescription.type, s: pc.localDescription.sdp }));
-      });
+        connTitle.textContent = "Step 2: Copy Reply Code";
+        connInstruction.textContent = "Copy this reply code and send it back to Device A:";
+        joinBox.classList.add('hidden');
+        textQr.style.display = 'block';
+        textQr.textContent = btoa(JSON.stringify({ t: pc.localDescription.type, s: pc.localDescription.sdp }));
+      } catch (err) {
+        alert("Invalid offer code!");
+      }
     });
 
+    // File Transfer Handler
     document.getElementById('send-btn').addEventListener('click', async () => {
       const files = document.getElementById('file-input').files;
       if (!files.length || !dataChannel || dataChannel.readyState !== 'open') return;
@@ -299,7 +244,7 @@
 
           const pct = Math.min(100, Math.round((offset / file.size) * 100));
           sendBar.value = pct;
-          sendStatus.textContent = `Sending ${file.name}... ${pct}%`;
+          sendStatus.textContent = `Sending ${file.name}... ${pct%}%`;
         }
 
         dataChannel.send(JSON.stringify({ type: 'eof' }));
